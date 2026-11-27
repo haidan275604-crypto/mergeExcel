@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-多文件 Excel 指定行/列合并工具
+多文件 Excel 指定行/列合并工具 (终极智能去重版)
 """
 import os
 import traceback
@@ -11,9 +11,19 @@ from openpyxl import load_workbook
 import zipfile
 
 
+# ---------------- 辅助函数：智能拆分名字 ----------------
+def parse_names(val):
+    """将单元格数据统一拆分，支持顿号、中英文逗号，并去除空格和空字符串"""
+    if val is None:
+        return []
+    # 把中英文逗号统一替换为顿号，去掉所有空格
+    s = str(val).replace(",", "、").replace("，", "、").replace(" ", "").strip()
+    # 按顿号拆分并过滤空串
+    return [x for x in s.split("、") if x]
+
+
 # ---------------- 核心合并逻辑 ----------------
 def merge_column(a_paths, b_path, out_path, col=5, start_row=2):
-    # 校验后缀
     if not b_path.lower().endswith(".xlsx") or not all(p.lower().endswith(".xlsx") for p in a_paths):
         raise ValueError("文件格式错误：请确保 A、B 文件都是 .xlsx 格式！")
 
@@ -27,11 +37,9 @@ def merge_column(a_paths, b_path, out_path, col=5, start_row=2):
     ws_b = wb_b.worksheets[0]
     max_row_b = ws_b.max_row
 
-    # 用于记录每个发生变动或跳过的行的情况
-    # history = {行号: {"original": "B最初的数据", "current": "最终合并的数据", "logs": ["A1...", "A2..."]}}
+    # 记录历史情况
     history = {}
 
-    # 依次遍历每个 A 文件
     for a_path in a_paths:
         try:
             wb_a = load_workbook(a_path, data_only=True)
@@ -46,48 +54,48 @@ def merge_column(a_paths, b_path, out_path, col=5, start_row=2):
             a_val = ws_a.cell(row=r, column=col).value
             b_val = ws_b.cell(row=r, column=col).value
 
-            a_empty = a_val is None or str(a_val).strip() == ""
-            b_empty = b_val is None or str(b_val).strip() == ""
-
-            if a_empty:
+            if a_val is None or str(a_val).strip() == "":
                 continue
+
+            # 拆分当前 B 单元格为列表
+            current_b_list = parse_names(b_val)
 
             # 初始化该行的记录
             if r not in history:
                 history[r] = {
-                    "original": "" if b_empty else str(b_val).strip(),
-                    "current": "" if b_empty else str(b_val).strip(),
+                    "original": "、".join(current_b_list),
+                    "current": "、".join(current_b_list),
                     "logs": []
                 }
 
-            if b_empty:
-                # B 为空，直接填入 A
-                ws_b.cell(row=r, column=col, value=a_val)
-                history[r]["current"] = str(a_val).strip()
-                history[r]["logs"].append(f"由 {a_name} 填入")
-            else:
-                # 两边都有数据
-                str_a = str(a_val).strip()
-                str_b = str(b_val).strip()
+            # 拆分当前 A 单元格为列表
+            incoming_a_list = parse_names(a_val)
 
-                # ★ 查重逻辑：如果 A 的值已经存在于 B 当前的字符串中，则视为一致跳过
-                existing_items = str_b.split("、")
-                if str_a in existing_items:
-                    history[r]["logs"].append(f"{a_name} 内容一致(跳过)")
-                    continue
+            # 找出 A 中 B 没有的新元素
+            added_items = []
+            for item in incoming_a_list:
+                if item not in current_b_list:
+                    current_b_list.append(item)
+                    added_items.append(item)
 
-                # 内容不同 → 拼接合并
-                merged_val = f"{b_val}、{a_val}"
-                ws_b.cell(row=r, column=col, value=merged_val)
-                history[r]["current"] = merged_val
-                history[r]["logs"].append(f"合并了 {a_name}")
+            # 如果 A 里的元素全都在 B 里了，直接跳过
+            if not added_items:
+                history[r]["logs"].append(f"{a_name} 已存在(跳过)")
+                continue
+
+            # 如果有新元素，重新组合并写回 Excel
+            merged_val = "、".join(current_b_list)
+            ws_b.cell(row=r, column=col, value=merged_val)
+
+            history[r]["current"] = merged_val
+            history[r]["logs"].append(f"从 {a_name} 添加了: {'、'.join(added_items)}")
 
     try:
         wb_b.save(out_path)
     except PermissionError:
         raise ValueError("保存失败！输出文件正被占用，请关闭后重试。")
 
-    # 整理最终要展示给用户的数据
+    # 整理最终展示数据
     results = []
     for r, data in history.items():
         if data["logs"]:
@@ -240,7 +248,6 @@ class App:
             self.status.config(text="合并失败，请检查文件。", foreground="red")
             return
 
-        # 成功之后：清空
         self.clear_a_files()
         self.b_path.set("")
         self.out_path.set("")
@@ -264,16 +271,16 @@ class ResultWindow:
                                                                                                  pady=(0, 10))
 
         if results:
-            info_text = f"共处理了 {len(results)} 行有变动的单元格（包含合并与跳过）。"
+            info_text = f"共处理了 {len(results)} 行有变动的单元格（已自动过滤重复项）。"
         else:
-            info_text = "文件合并完成，未发现需要合并或跳过的重合数据。"
+            info_text = "文件合并完成，未发现需要新增的数据。"
 
         ttk.Label(main_f, text=info_text, foreground="#333").pack(anchor="w", pady=(0, 10))
 
         if results:
             ttk.Label(main_f, text="处理明细（按行汇总）：").pack(anchor="w")
 
-            cols = ("行号", "B文件原始数据", "最终结果", "处理明细")
+            cols = ("行号", "B文件最初数据", "最终结果", "处理明细")
             tree = ttk.Treeview(main_f, columns=cols, show="headings", height=12)
 
             widths = (60, 180, 200, 320)
