@@ -31,10 +31,10 @@ def merge_column(a_path, b_path, out_path, col=5, start_row=2):
 
     last_row = min(ws_a.max_row, ws_b.max_row)
 
-    duplicate_rows = []
-    filled_rows = []
+    duplicate_rows = []  # 两边数据不同，已拼接的
+    same_rows = []  # 两边数据相同，跳过的
+    filled_rows = []  # B 为空，直接填充的
 
-    # ★ 根据传入的 start_row 开始循环
     for r in range(start_row, last_row + 1):
         a_val = ws_a.cell(row=r, column=col).value
         b_val = ws_b.cell(row=r, column=col).value
@@ -44,11 +44,20 @@ def merge_column(a_path, b_path, out_path, col=5, start_row=2):
 
         if a_empty:
             continue
+
         if not b_empty:
-            # 两边都有数据 → 合并数据，用顿号连接
-            merged_val = f"{b_val}、{a_val}"
-            ws_b.cell(row=r, column=col, value=merged_val)
-            duplicate_rows.append((r, b_val, a_val, merged_val))
+            # 两边都有数据
+            str_a = str(a_val).strip()
+            str_b = str(b_val).strip()
+
+            if str_a == str_b:
+                # ★ 新增：内容完全一致，不做任何修改，保留原样
+                same_rows.append((r, b_val, a_val))
+            else:
+                # 内容不同 → 拼接合并
+                merged_val = f"{b_val}、{a_val}"
+                ws_b.cell(row=r, column=col, value=merged_val)
+                duplicate_rows.append((r, b_val, a_val, merged_val))
         else:
             # b 为空，a 有数据 → 直接填入
             ws_b.cell(row=r, column=col, value=a_val)
@@ -59,7 +68,7 @@ def merge_column(a_path, b_path, out_path, col=5, start_row=2):
     except PermissionError:
         raise ValueError(f"保存失败！\n\n输出文件正被其他程序占用，请关闭该文件或换一个输出文件名。")
 
-    return filled_rows, duplicate_rows
+    return filled_rows, duplicate_rows, same_rows
 
 
 # ---------------- GUI 主界面 ----------------
@@ -67,10 +76,10 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Excel 行/列合并工具")
-        root.geometry("620x400")
+        root.geometry("620x420")
         # 允许窗口自由缩放
         root.resizable(True, True)
-        root.minsize(580, 350)
+        root.minsize(580, 380)
 
         # 全局样式美化
         self.style = ttk.Style()
@@ -101,7 +110,7 @@ class App:
         self._create_file_row(main_frame, 1, "B 文件 (目标文件)", self.b_path, self.pick_b)
         self._create_file_row(main_frame, 2, "输出保存为", self.out_path, self.pick_out)
 
-        # 2. 选项区域 (支持自定义起始行和列)
+        # 2. 选项区域
         opt_frame = ttk.Frame(main_frame)
         opt_frame.grid(row=3, column=0, columnspan=3, pady=(20, 5), sticky="w")
 
@@ -165,28 +174,28 @@ class App:
         try:
             self.status.config(text="正在合并中，请稍候…", foreground="blue")
             self.root.update()
-            filled, dup = merge_column(a, b, o, col, start_row)
+            filled, dup, same = merge_column(a, b, o, col, start_row)
         except Exception as e:
             messagebox.showerror("出错了", str(e))
             self.status.config(text="合并失败，请检查文件。", foreground="red")
             return
 
-        # ★ 成功之后：清空输入框
+        # 成功之后：清空输入框
         self.a_path.set("")
         self.b_path.set("")
         self.out_path.set("")
         self.status.config(text="✅ 合并成功！输入已清空，可进行下一次操作。", foreground="green")
 
         # 弹出结果展示窗
-        ResultWindow(self.root, o, filled, dup)
+        ResultWindow(self.root, o, filled, dup, same)
 
 
 # ---------------- 结果展示窗口 ----------------
 class ResultWindow:
-    def __init__(self, parent, out_path, filled, dup):
+    def __init__(self, parent, out_path, filled, dup, same):
         self.win = tk.Toplevel(parent)
         self.win.title("处理完成")
-        self.win.geometry("650x450")
+        self.win.geometry("700x480")
         self.win.transient(parent)
 
         main_f = ttk.Frame(self.win, padding=15)
@@ -195,32 +204,45 @@ class ResultWindow:
         ttk.Label(main_f, text=f"文件已保存至：\n{out_path}", font=("微软雅黑", 10, "bold")).pack(anchor="w",
                                                                                                  pady=(0, 10))
 
-        info_text = f"共向空单元格补充了 {len(filled)} 行数据。"
-        if dup:
-            info_text += f" 且发现 {len(dup)} 行重合数据，已用「、」合并。"
+        # 组合提示文案
+        info_text = f"共向空单元格补充了 {len(filled)} 行数据。\n"
+        if dup or same:
+            if dup:
+                info_text += f"发现 {len(dup)} 行数据不一致，已用「、」拼接合并。\n"
+            if same:
+                info_text += f"发现 {len(same)} 行数据完全一致，已保持原样跳过。"
         else:
-            info_text += " 未发现重合数据。"
+            info_text += "未发现重复位置或重合数据。"
 
         ttk.Label(main_f, text=info_text, foreground="#333").pack(anchor="w", pady=(0, 10))
 
-        if dup:
+        # 展示重合数据明细
+        if dup or same:
             ttk.Label(main_f, text="重合数据明细：").pack(anchor="w")
-            cols = ("行号", "B 文件原数据", "A 文件新数据", "合并后结果")
+
+            # 新增一列“处理结果”，区分是拼接还是跳过
+            cols = ("行号", "B 文件原数据", "A 文件新数据", "处理结果", "状态")
             tree = ttk.Treeview(main_f, columns=cols, show="headings", height=10)
 
-            for c in cols:
+            # 设置列宽
+            widths = (60, 150, 150, 200, 100)
+            for c, w in zip(cols, widths):
                 tree.heading(c, text=c)
-                tree.column(c, width=100, anchor="center")
+                tree.column(c, width=w, anchor="center")
 
-            tree.column("合并后结果", width=200)
             tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=5)
 
             scrollbar = ttk.Scrollbar(main_f, orient=tk.VERTICAL, command=tree.yview)
             tree.configure(yscroll=scrollbar.set)
             scrollbar.pack(side=tk.LEFT, fill=tk.Y, pady=5)
 
+            # 插入“不一致拼接”的记录
             for r, old_b, old_a, new_val in dup:
-                tree.insert("", tk.END, values=(r, old_b, old_a, new_val))
+                tree.insert("", tk.END, values=(r, old_b, old_a, new_val, "拼接合并"))
+
+            # 插入“一致跳过”的记录
+            for r, old_b, old_a in same:
+                tree.insert("", tk.END, values=(r, old_b, old_a, old_b, "内容一致(保留)"))
 
         ttk.Button(main_f, text="我知道了", command=self.win.destroy).pack(side=tk.BOTTOM, pady=10)
 
