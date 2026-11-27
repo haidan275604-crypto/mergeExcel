@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Excel 指定行、指定列合并工具（美化自适应版）
+多文件 Excel 指定行/列合并工具
 """
 import os
 import traceback
@@ -12,76 +12,105 @@ import zipfile
 
 
 # ---------------- 核心合并逻辑 ----------------
-def merge_column(a_path, b_path, out_path, col=5, start_row=2):
-    if not a_path.lower().endswith(".xlsx") or not b_path.lower().endswith(".xlsx"):
-        raise ValueError(
-            "文件格式错误：请确保 A 文件和 B 文件都是 .xlsx 格式！\n\n如果是 .xls 文件，请先用 Excel 另存为 .xlsx")
+def merge_column(a_paths, b_path, out_path, col=5, start_row=2):
+    # 校验后缀
+    if not b_path.lower().endswith(".xlsx") or not all(p.lower().endswith(".xlsx") for p in a_paths):
+        raise ValueError("文件格式错误：请确保 A、B 文件都是 .xlsx 格式！")
 
     try:
-        wb_a = load_workbook(a_path, data_only=True)
         wb_b = load_workbook(b_path)
     except zipfile.BadZipFile:
-        raise ValueError(
-            "文件读取失败！\n\n可能的原因：\n1. 文件不是标准的 xlsx 格式\n2. 文件已损坏\n3. 文件设置了密码\n4. 文件正被其他软件（如Excel/WPS）占用。")
+        raise ValueError("B 文件读取失败！可能被加密、损坏或正在被占用。")
     except Exception as e:
-        raise ValueError(f"读取文件时发生错误：\n{e}")
+        raise ValueError(f"读取 B 文件时发生错误：\n{e}")
 
-    ws_a = wb_a.worksheets[0]
     ws_b = wb_b.worksheets[0]
+    max_row_b = ws_b.max_row
 
-    last_row = min(ws_a.max_row, ws_b.max_row)
+    # 用于记录每个发生变动或跳过的行的情况
+    # history = {行号: {"original": "B最初的数据", "current": "最终合并的数据", "logs": ["A1...", "A2..."]}}
+    history = {}
 
-    duplicate_rows = []  # 两边数据不同，已拼接的
-    same_rows = []  # 两边数据相同，跳过的
-    filled_rows = []  # B 为空，直接填充的
+    # 依次遍历每个 A 文件
+    for a_path in a_paths:
+        try:
+            wb_a = load_workbook(a_path, data_only=True)
+        except Exception as e:
+            raise ValueError(f"读取 A 文件 [{os.path.basename(a_path)}] 失败：\n{e}")
 
-    for r in range(start_row, last_row + 1):
-        a_val = ws_a.cell(row=r, column=col).value
-        b_val = ws_b.cell(row=r, column=col).value
+        ws_a = wb_a.worksheets[0]
+        last_row = min(ws_a.max_row, max_row_b)
+        a_name = os.path.basename(a_path)
 
-        a_empty = a_val is None or str(a_val).strip() == ""
-        b_empty = b_val is None or str(b_val).strip() == ""
+        for r in range(start_row, last_row + 1):
+            a_val = ws_a.cell(row=r, column=col).value
+            b_val = ws_b.cell(row=r, column=col).value
 
-        if a_empty:
-            continue
+            a_empty = a_val is None or str(a_val).strip() == ""
+            b_empty = b_val is None or str(b_val).strip() == ""
 
-        if not b_empty:
-            # 两边都有数据
-            str_a = str(a_val).strip()
-            str_b = str(b_val).strip()
+            if a_empty:
+                continue
 
-            if str_a == str_b:
-                # ★ 新增：内容完全一致，不做任何修改，保留原样
-                same_rows.append((r, b_val, a_val))
+            # 初始化该行的记录
+            if r not in history:
+                history[r] = {
+                    "original": "" if b_empty else str(b_val).strip(),
+                    "current": "" if b_empty else str(b_val).strip(),
+                    "logs": []
+                }
+
+            if b_empty:
+                # B 为空，直接填入 A
+                ws_b.cell(row=r, column=col, value=a_val)
+                history[r]["current"] = str(a_val).strip()
+                history[r]["logs"].append(f"由 {a_name} 填入")
             else:
+                # 两边都有数据
+                str_a = str(a_val).strip()
+                str_b = str(b_val).strip()
+
+                # ★ 查重逻辑：如果 A 的值已经存在于 B 当前的字符串中，则视为一致跳过
+                existing_items = str_b.split("、")
+                if str_a in existing_items:
+                    history[r]["logs"].append(f"{a_name} 内容一致(跳过)")
+                    continue
+
                 # 内容不同 → 拼接合并
                 merged_val = f"{b_val}、{a_val}"
                 ws_b.cell(row=r, column=col, value=merged_val)
-                duplicate_rows.append((r, b_val, a_val, merged_val))
-        else:
-            # b 为空，a 有数据 → 直接填入
-            ws_b.cell(row=r, column=col, value=a_val)
-            filled_rows.append(r)
+                history[r]["current"] = merged_val
+                history[r]["logs"].append(f"合并了 {a_name}")
 
     try:
         wb_b.save(out_path)
     except PermissionError:
-        raise ValueError(f"保存失败！\n\n输出文件正被其他程序占用，请关闭该文件或换一个输出文件名。")
+        raise ValueError("保存失败！输出文件正被占用，请关闭后重试。")
 
-    return filled_rows, duplicate_rows, same_rows
+    # 整理最终要展示给用户的数据
+    results = []
+    for r, data in history.items():
+        if data["logs"]:
+            results.append({
+                "row": r,
+                "original": data["original"],
+                "current": data["current"],
+                "logs": " | ".join(data["logs"])
+            })
+
+    results.sort(key=lambda x: x["row"])
+    return results
 
 
 # ---------------- GUI 主界面 ----------------
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Excel 行/列合并工具")
-        root.geometry("620x420")
-        # 允许窗口自由缩放
+        root.title("多文件 Excel 行/列合并工具")
+        root.geometry("720x550")
         root.resizable(True, True)
-        root.minsize(580, 380)
+        root.minsize(650, 480)
 
-        # 全局样式美化
         self.style = ttk.Style()
         if "clam" in self.style.theme_names():
             self.style.theme_use("clam")
@@ -90,12 +119,11 @@ class App:
         self.style.configure("Browse.TButton", padding=2)
         self.style.configure("TLabel", font=("微软雅黑", 10))
         self.style.configure("TEntry", padding=4)
+        self.style.configure("TButton", font=("微软雅黑", 9))
 
-        self.a_path = tk.StringVar()
         self.b_path = tk.StringVar()
         self.out_path = tk.StringVar()
 
-        # 默认起始行2，操作列号5
         self.start_row_var = tk.StringVar(value="2")
         self.col_var = tk.StringVar(value="5")
 
@@ -105,12 +133,32 @@ class App:
         main_frame = ttk.Frame(self.root, padding="20 20 20 20")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 1. 文件选择区域
-        self._create_file_row(main_frame, 0, "A 文件 (提供数据)", self.a_path, self.pick_a)
+        # --- 1. A 文件列表区域 ---
+        a_frame = ttk.Frame(main_frame)
+        a_frame.grid(row=0, column=0, columnspan=3, pady=(0, 15), sticky="ew")
+
+        ttk.Label(a_frame, text="A 文件列表(按序合并):", width=18, anchor="w").pack(side=tk.LEFT, anchor="n")
+
+        list_frame = ttk.Frame(a_frame)
+        list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.a_listbox = tk.Listbox(list_frame, height=6, font=("微软雅黑", 9), selectmode=tk.EXTENDED)
+        self.a_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        a_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.a_listbox.yview)
+        self.a_listbox.configure(yscrollcommand=a_scroll.set)
+        a_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        btn_a_frame = ttk.Frame(a_frame)
+        btn_a_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
+        ttk.Button(btn_a_frame, text="➕ 添加", command=self.add_a_files).pack(fill=tk.X, pady=2)
+        ttk.Button(btn_a_frame, text="🗑️ 清空", command=self.clear_a_files).pack(fill=tk.X, pady=2)
+
+        # --- 2. B 文件及输出区域 ---
         self._create_file_row(main_frame, 1, "B 文件 (目标文件)", self.b_path, self.pick_b)
         self._create_file_row(main_frame, 2, "输出保存为", self.out_path, self.pick_out)
 
-        # 2. 选项区域
+        # --- 3. 选项区域 ---
         opt_frame = ttk.Frame(main_frame)
         opt_frame.grid(row=3, column=0, columnspan=3, pady=(20, 5), sticky="w")
 
@@ -121,27 +169,33 @@ class App:
         ttk.Label(opt_frame, text="操作列号:").pack(side=tk.LEFT)
         ttk.Spinbox(opt_frame, from_=1, to=9, textvariable=self.col_var, width=5).pack(side=tk.LEFT, padx=(5, 0))
 
-        # 3. 开始按钮区域
+        # --- 4. 开始按钮 ---
         btn_frame = ttk.Frame(main_frame)
         btn_frame.grid(row=4, column=0, columnspan=3, pady=30)
         ttk.Button(btn_frame, text="🚀 开始合并", style="Action.TButton", command=self.start).pack()
 
-        # 4. 状态栏
-        self.status = ttk.Label(main_frame, text="请选择文件并设置好行/列，点击「开始合并」", foreground="gray")
+        # --- 5. 状态栏 ---
+        self.status = ttk.Label(main_frame, text="请添加 A 文件并选择 B 文件，点击开始合并", foreground="gray")
         self.status.grid(row=5, column=0, columnspan=3, sticky="s")
 
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(5, weight=1)
 
     def _create_file_row(self, parent, row, label_text, var, cmd):
-        ttk.Label(parent, text=label_text, width=16, anchor="w").grid(row=row, column=0, pady=8, sticky="w")
+        ttk.Label(parent, text=label_text, width=18, anchor="w").grid(row=row, column=0, pady=8, sticky="w")
         ttk.Entry(parent, textvariable=var).grid(row=row, column=1, padx=10, sticky="ew")
         ttk.Button(parent, text="选择…", style="Browse.TButton", command=cmd).grid(row=row, column=2, sticky="e")
 
-    def pick_a(self):
-        p = filedialog.askopenfilename(title="选择 A 文件", filetypes=[("Excel 文件", "*.xlsx")])
-        if p:
-            self.a_path.set(p)
+    def add_a_files(self):
+        paths = filedialog.askopenfilenames(title="选择 A 文件（可多选）", filetypes=[("Excel 文件", "*.xlsx")])
+        if paths:
+            existing = self.a_listbox.get(0, tk.END)
+            for p in paths:
+                if p not in existing:
+                    self.a_listbox.insert(tk.END, p)
+
+    def clear_a_files(self):
+        self.a_listbox.delete(0, tk.END)
 
     def pick_b(self):
         p = filedialog.askopenfilename(title="选择 B 文件", filetypes=[("Excel 文件", "*.xlsx")])
@@ -157,9 +211,15 @@ class App:
             self.out_path.set(p)
 
     def start(self):
-        a, b, o = self.a_path.get(), self.b_path.get(), self.out_path.get()
-        if not (a and b and o):
-            messagebox.showwarning("提示", "请把 A、B 文件和输出路径都选好。")
+        a_paths = list(self.a_listbox.get(0, tk.END))
+        b = self.b_path.get()
+        o = self.out_path.get()
+
+        if not a_paths:
+            messagebox.showwarning("提示", "请至少添加一个 A 文件。")
+            return
+        if not b or not o:
+            messagebox.showwarning("提示", "请选择 B 文件和输出路径。")
             return
 
         try:
@@ -174,28 +234,27 @@ class App:
         try:
             self.status.config(text="正在合并中，请稍候…", foreground="blue")
             self.root.update()
-            filled, dup, same = merge_column(a, b, o, col, start_row)
+            results = merge_column(a_paths, b, o, col, start_row)
         except Exception as e:
             messagebox.showerror("出错了", str(e))
             self.status.config(text="合并失败，请检查文件。", foreground="red")
             return
 
-        # 成功之后：清空输入框
-        self.a_path.set("")
+        # 成功之后：清空
+        self.clear_a_files()
         self.b_path.set("")
         self.out_path.set("")
         self.status.config(text="✅ 合并成功！输入已清空，可进行下一次操作。", foreground="green")
 
-        # 弹出结果展示窗
-        ResultWindow(self.root, o, filled, dup, same)
+        ResultWindow(self.root, o, results)
 
 
 # ---------------- 结果展示窗口 ----------------
 class ResultWindow:
-    def __init__(self, parent, out_path, filled, dup, same):
+    def __init__(self, parent, out_path, results):
         self.win = tk.Toplevel(parent)
         self.win.title("处理完成")
-        self.win.geometry("700x480")
+        self.win.geometry("800x500")
         self.win.transient(parent)
 
         main_f = ttk.Frame(self.win, padding=15)
@@ -204,28 +263,20 @@ class ResultWindow:
         ttk.Label(main_f, text=f"文件已保存至：\n{out_path}", font=("微软雅黑", 10, "bold")).pack(anchor="w",
                                                                                                  pady=(0, 10))
 
-        # 组合提示文案
-        info_text = f"共向空单元格补充了 {len(filled)} 行数据。\n"
-        if dup or same:
-            if dup:
-                info_text += f"发现 {len(dup)} 行数据不一致，已用「、」拼接合并。\n"
-            if same:
-                info_text += f"发现 {len(same)} 行数据完全一致，已保持原样跳过。"
+        if results:
+            info_text = f"共处理了 {len(results)} 行有变动的单元格（包含合并与跳过）。"
         else:
-            info_text += "未发现重复位置或重合数据。"
+            info_text = "文件合并完成，未发现需要合并或跳过的重合数据。"
 
         ttk.Label(main_f, text=info_text, foreground="#333").pack(anchor="w", pady=(0, 10))
 
-        # 展示重合数据明细
-        if dup or same:
-            ttk.Label(main_f, text="重合数据明细：").pack(anchor="w")
+        if results:
+            ttk.Label(main_f, text="处理明细（按行汇总）：").pack(anchor="w")
 
-            # 新增一列“处理结果”，区分是拼接还是跳过
-            cols = ("行号", "B 文件原数据", "A 文件新数据", "处理结果", "状态")
-            tree = ttk.Treeview(main_f, columns=cols, show="headings", height=10)
+            cols = ("行号", "B文件原始数据", "最终结果", "处理明细")
+            tree = ttk.Treeview(main_f, columns=cols, show="headings", height=12)
 
-            # 设置列宽
-            widths = (60, 150, 150, 200, 100)
+            widths = (60, 180, 200, 320)
             for c, w in zip(cols, widths):
                 tree.heading(c, text=c)
                 tree.column(c, width=w, anchor="center")
@@ -236,13 +287,8 @@ class ResultWindow:
             tree.configure(yscroll=scrollbar.set)
             scrollbar.pack(side=tk.LEFT, fill=tk.Y, pady=5)
 
-            # 插入“不一致拼接”的记录
-            for r, old_b, old_a, new_val in dup:
-                tree.insert("", tk.END, values=(r, old_b, old_a, new_val, "拼接合并"))
-
-            # 插入“一致跳过”的记录
-            for r, old_b, old_a in same:
-                tree.insert("", tk.END, values=(r, old_b, old_a, old_b, "内容一致(保留)"))
+            for item in results:
+                tree.insert("", tk.END, values=(item["row"], item["original"], item["current"], item["logs"]))
 
         ttk.Button(main_f, text="我知道了", command=self.win.destroy).pack(side=tk.BOTTOM, pady=10)
 
